@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["...", "python3"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[phases.build]
+cmds = ["cd client && npm install && npx vite build"]
+
+[start]
+cmd = "node server/index.js"
