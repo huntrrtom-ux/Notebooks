@@ -53,7 +53,7 @@ export default function CanvasCard({
       onUpdate({
         title: result.title,
         content: result.transcript,
-        meta: { videoId: result.videoId, thumbnailUrl: result.thumbnailUrl, url: youtubeUrl.trim() },
+        meta: { videoId: result.videoId, thumbnailUrl: result.thumbnailUrl, url: youtubeUrl.trim(), method: result.method },
       });
       setYoutubeUrl('');
     } catch (err) {
@@ -122,7 +122,7 @@ export default function CanvasCard({
         {item.type === 'youtube' && isYoutubeEmpty ? (
           <div className="youtube-input-form">
             <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: 4 }}>
-              Paste a YouTube URL to fetch its transcript
+              Paste a YouTube URL to fetch its transcript (auto-detects captions, falls back to AI transcription)
             </p>
             <input
               className="input"
@@ -138,18 +138,30 @@ export default function CanvasCard({
               onClick={(e) => { e.stopPropagation(); fetchYoutubeTranscript(); }}
               disabled={youtubeLoading}
             >
-              {youtubeLoading ? 'Fetching...' : 'Fetch Transcript'}
+              {youtubeLoading ? 'Transcribing…' : 'Fetch Transcript'}
             </button>
           </div>
         ) : item.type === 'youtube' ? (
           <>
             {item.meta?.thumbnailUrl && (
-              <img
-                className="thumbnail"
-                src={item.meta.thumbnailUrl}
-                alt={item.title}
-                draggable={false}
-              />
+              <div style={{ position: 'relative' }}>
+                <img
+                  className="thumbnail"
+                  src={item.meta.thumbnailUrl}
+                  alt={item.title}
+                  draggable={false}
+                />
+                {item.meta?.method && item.meta.method !== 'captions' && (
+                  <span style={{
+                    position: 'absolute', top: 4, right: 4,
+                    background: 'rgba(0,0,0,0.7)', color: '#fff',
+                    fontSize: '0.65rem', padding: '2px 6px', borderRadius: 4,
+                    textTransform: 'uppercase', letterSpacing: '0.5px',
+                  }}>
+                    {item.meta.method === 'whisper' ? 'AI Transcribed (Whisper)' : 'AI Transcribed (AssemblyAI)'}
+                  </span>
+                )}
+              </div>
             )}
             <div className="transcript-preview">{item.content}</div>
           </>
