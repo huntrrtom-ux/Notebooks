@@ -352,6 +352,47 @@ router.get('/status', async (req, res) => {
   });
 });
 
+// ─── Debug test endpoint ───────────────────────────────────────────────────
+
+router.get('/test/:videoId', async (req, res) => {
+  const videoId = req.params.videoId;
+  const results = {};
+
+  // Test direct captions
+  try {
+    const { transcript, title } = await tryDirectCaptions(videoId);
+    results.direct_captions = { success: true, title, preview: transcript.substring(0, 200) + '...' };
+  } catch (err) {
+    results.direct_captions = { success: false, error: err.message };
+  }
+
+  // Test youtube-transcript lib
+  try {
+    const { transcript } = await tryYoutubeTranscriptLib(videoId);
+    results.youtube_transcript_lib = { success: true, preview: transcript.substring(0, 200) + '...' };
+  } catch (err) {
+    results.youtube_transcript_lib = { success: false, error: err.message };
+  }
+
+  // Test audio download (don't actually transcribe, just see if we can get audio)
+  try {
+    const audioPath = await downloadAudio(videoId);
+    const stats = fs.statSync(audioPath);
+    results.audio_download = { success: true, fileSize: `${(stats.size / 1024 / 1024).toFixed(2)} MB`, path: audioPath };
+    fs.unlink(audioPath, () => {});
+  } catch (err) {
+    results.audio_download = { success: false, error: err.message };
+  }
+
+  // Check API keys
+  results.api_keys = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY ? `set (${process.env.OPENAI_API_KEY.substring(0, 8)}...)` : 'NOT SET',
+    ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY ? `set (${process.env.ASSEMBLYAI_API_KEY.substring(0, 8)}...)` : 'NOT SET',
+  };
+
+  res.json(results);
+});
+
 // ─── Main transcript endpoint ──────────────────────────────────────────────
 
 router.post('/transcript', async (req, res) => {
