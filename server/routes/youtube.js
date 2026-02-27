@@ -354,41 +354,57 @@ router.get('/status', async (req, res) => {
 
 // ─── Debug test endpoint ───────────────────────────────────────────────────
 
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)),
+  ]);
+}
+
 router.get('/test/:videoId', async (req, res) => {
   const videoId = req.params.videoId;
-  const results = {};
+  const results = { videoId, timestamp: new Date().toISOString() };
 
-  // Test direct captions
+  // Check API keys first (instant)
+  results.api_keys = {
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY ? `set (${process.env.OPENAI_API_KEY.substring(0, 8)}...)` : 'NOT SET',
+    ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY ? `set (${process.env.ASSEMBLYAI_API_KEY.substring(0, 8)}...)` : 'NOT SET',
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ? 'set' : 'NOT SET',
+  };
+
+  // Test direct captions (15s timeout)
   try {
-    const { transcript, title } = await tryDirectCaptions(videoId);
-    results.direct_captions = { success: true, title, preview: transcript.substring(0, 200) + '...' };
+    const { transcript, title } = await withTimeout(tryDirectCaptions(videoId), 15000, 'Direct captions');
+    results.direct_captions = { success: true, title, chars: transcript.length, preview: transcript.substring(0, 150) };
   } catch (err) {
     results.direct_captions = { success: false, error: err.message };
   }
 
-  // Test youtube-transcript lib
+  // Test youtube-transcript lib (10s timeout)
   try {
-    const { transcript } = await tryYoutubeTranscriptLib(videoId);
-    results.youtube_transcript_lib = { success: true, preview: transcript.substring(0, 200) + '...' };
+    const { transcript } = await withTimeout(tryYoutubeTranscriptLib(videoId), 10000, 'youtube-transcript');
+    results.youtube_transcript_lib = { success: true, chars: transcript.length, preview: transcript.substring(0, 150) };
   } catch (err) {
     results.youtube_transcript_lib = { success: false, error: err.message };
   }
 
-  // Test audio download (don't actually transcribe, just see if we can get audio)
-  try {
-    const audioPath = await downloadAudio(videoId);
-    const stats = fs.statSync(audioPath);
-    results.audio_download = { success: true, fileSize: `${(stats.size / 1024 / 1024).toFixed(2)} MB`, path: audioPath };
-    fs.unlink(audioPath, () => {});
-  } catch (err) {
-    results.audio_download = { success: false, error: err.message };
-  }
-
-  // Check API keys
-  results.api_keys = {
-    OPENAI_API_KEY: process.env.OPENAI_API_KEY ? `set (${process.env.OPENAI_API_KEY.substring(0, 8)}...)` : 'NOT SET',
-    ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY ? `set (${process.env.ASSEMBLYAI_API_KEY.substring(0, 8)}...)` : 'NOT SET',
+  // Skip audio download in test (too slow) — just check availability
+  results.audio_download = {
+    ytDlp: await isYtDlpAvailable(),
+    note: 'Audio download skipped in test (too slow). Use ?audio=1 to test.',
   };
+
+  // Optionally test audio download if ?audio=1
+  if (req.query.audio === '1') {
+    try {
+      const audioPath = await withTimeout(downloadAudio(videoId), 60000, 'Audio download');
+      const stats = fs.statSync(audioPath);
+      results.audio_download = { success: true, fileSize: `${(stats.size / 1024 / 1024).toFixed(2)} MB` };
+      fs.unlink(audioPath, () => {});
+    } catch (err) {
+      results.audio_download = { success: false, error: err.message };
+    }
+  }
 
   res.json(results);
 });
