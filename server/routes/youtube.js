@@ -1,5 +1,4 @@
 const express = require('express');
-const { YoutubeTranscript } = require('youtube-transcript');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -21,75 +20,115 @@ function extractVideoId(url) {
 }
 
 // Check if yt-dlp is available on the system
-function isYtDlpAvailable() {
+let _ytDlpAvailable = null;
+async function isYtDlpAvailable() {
+  if (_ytDlpAvailable !== null) return _ytDlpAvailable;
   return new Promise((resolve) => {
     execFile('yt-dlp', ['--version'], { timeout: 5000 }, (error) => {
-      resolve(!error);
+      _ytDlpAvailable = !error;
+      resolve(_ytDlpAvailable);
     });
   });
 }
 
-// Fetch video title — tries yt-dlp first, then ytdl-core
-async function fetchVideoTitle(videoId) {
-  // Try yt-dlp
-  try {
-    const title = await new Promise((resolve, reject) => {
-      execFile('yt-dlp', ['--get-title', '--no-download', `https://www.youtube.com/watch?v=${videoId}`], {
-        timeout: 15000,
-      }, (error, stdout) => {
-        if (error || !stdout.trim()) reject(new Error('yt-dlp title failed'));
-        else resolve(stdout.trim());
-      });
-    });
-    return title;
-  } catch {}
+// ─── Direct YouTube Caption Extraction (no npm deps) ───────────────────────
 
-  // Try youtubei.js
-  try {
-    const { Innertube } = require('youtubei.js');
-    const yt = await Innertube.create();
-    const info = await yt.getBasicInfo(videoId);
-    if (info.basic_info?.title) return info.basic_info.title;
-  } catch {}
+// Fetch the YouTube watch page and extract player data
+async function fetchPlayerData(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+  if (!res.ok) throw new Error(`YouTube page fetch failed: ${res.status}`);
+  const html = await res.text();
 
-  // Try ytdl-core
-  try {
-    const ytdl = require('@distube/ytdl-core');
-    const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
-    if (info.videoDetails?.title) return info.videoDetails.title;
-  } catch {}
+  // Extract ytInitialPlayerResponse
+  const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?})\s*;/);
+  if (!playerMatch) throw new Error('Could not find player data in page');
 
-  return `YouTube Video (${videoId})`;
+  try {
+    return JSON.parse(playerMatch[1]);
+  } catch {
+    throw new Error('Failed to parse player data');
+  }
 }
 
-// Method 1a: youtube-transcript library (captions)
-async function tryYoutubeTranscript(videoId) {
+// Extract caption tracks from player data
+function getCaptionTracks(playerData) {
+  const captions = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!captions || captions.length === 0) return [];
+  return captions;
+}
+
+// Fetch and parse a caption track URL (returns XML with text segments)
+async function fetchCaptionTrack(trackUrl) {
+  const res = await fetch(trackUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    },
+  });
+  if (!res.ok) throw new Error(`Caption track fetch failed: ${res.status}`);
+  const xml = await res.text();
+
+  // Parse XML caption segments: <text start="1.23" dur="4.56">caption text</text>
+  const segments = [];
+  const regex = /<text[^>]*>([^<]*)<\/text>/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    // Decode HTML entities
+    const text = match[1]
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\n/g, ' ')
+      .trim();
+    if (text) segments.push(text);
+  }
+  return segments;
+}
+
+// Method 1: Direct caption extraction from YouTube page (no dependencies)
+async function tryDirectCaptions(videoId) {
+  console.log(`[YouTube] Fetching page for ${videoId}...`);
+  const playerData = await fetchPlayerData(videoId);
+
+  // Get video title from player data
+  const title = playerData?.videoDetails?.title || `YouTube Video (${videoId})`;
+
+  const tracks = getCaptionTracks(playerData);
+  if (tracks.length === 0) {
+    throw new Error('No caption tracks available for this video');
+  }
+
+  // Prefer English, then auto-generated English, then first available
+  const englishTrack = tracks.find(t => t.languageCode === 'en' && t.kind !== 'asr')
+    || tracks.find(t => t.languageCode === 'en')
+    || tracks[0];
+
+  console.log(`[YouTube] Found caption track: ${englishTrack.name?.simpleText || englishTrack.languageCode} (${englishTrack.kind || 'manual'})`);
+
+  const segments = await fetchCaptionTrack(englishTrack.baseUrl);
+  const transcript = segments.join(' ');
+  if (!transcript.trim()) throw new Error('Caption track returned empty text');
+
+  return { transcript, title, method: 'captions' };
+}
+
+// Method 2: youtube-transcript npm library (backup caption method)
+async function tryYoutubeTranscriptLib(videoId) {
+  const { YoutubeTranscript } = require('youtube-transcript');
   const transcriptItems = await YoutubeTranscript.fetchTranscript(videoId);
   const transcript = transcriptItems.map(item => item.text).join(' ');
   if (!transcript.trim()) throw new Error('Empty transcript');
   return { transcript, method: 'captions' };
 }
 
-// Method 1b: youtubei.js Innertube captions (more reliable)
-async function tryInnertubeTranscript(videoId) {
-  const { Innertube } = require('youtubei.js');
-  const yt = await Innertube.create();
-  const info = await yt.getBasicInfo(videoId);
-  const transcriptInfo = await info.getTranscript();
-
-  if (!transcriptInfo?.transcript?.content?.body?.initial_segments) {
-    throw new Error('No transcript segments found');
-  }
-
-  const segments = transcriptInfo.transcript.content.body.initial_segments;
-  const transcript = segments
-    .map(seg => seg.snippet?.text || '')
-    .filter(Boolean)
-    .join(' ');
-
-  if (!transcript.trim()) throw new Error('Empty Innertube transcript');
-  return { transcript, method: 'captions' };
-}
+// ─── Audio Download Methods ────────────────────────────────────────────────
 
 // Download audio using yt-dlp (system binary)
 function downloadAudioYtDlp(videoId) {
@@ -112,7 +151,6 @@ function downloadAudioYtDlp(videoId) {
         reject(new Error(`yt-dlp failed: ${stderr || error.message}`));
         return;
       }
-      // Find the output file (yt-dlp may adjust extension)
       const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`yt-audio-${videoId}`));
       if (files.length > 0) {
         resolve(path.join(tmpDir, files[files.length - 1]));
@@ -125,6 +163,35 @@ function downloadAudioYtDlp(videoId) {
   });
 }
 
+// Download audio using youtubei.js (pure Node.js)
+async function downloadAudioInnertube(videoId) {
+  const { Innertube } = require('youtubei.js');
+  const tmpDir = os.tmpdir();
+  const outputPath = path.join(tmpDir, `yt-audio-${videoId}-${Date.now()}.webm`);
+
+  const yt = await Innertube.create();
+  const stream = await yt.download(videoId, { type: 'audio', quality: 'best' });
+  const writeStream = fs.createWriteStream(outputPath);
+
+  for await (const chunk of stream) {
+    writeStream.write(chunk);
+  }
+  writeStream.end();
+
+  return new Promise((resolve, reject) => {
+    writeStream.on('finish', () => {
+      const stats = fs.statSync(outputPath);
+      if (stats.size < 1000) {
+        fs.unlinkSync(outputPath);
+        reject(new Error('Downloaded audio file too small'));
+      } else {
+        resolve(outputPath);
+      }
+    });
+    writeStream.on('error', reject);
+  });
+}
+
 // Download audio using @distube/ytdl-core (pure Node.js)
 async function downloadAudioYtdlCore(videoId) {
   const ytdl = require('@distube/ytdl-core');
@@ -133,7 +200,6 @@ async function downloadAudioYtdlCore(videoId) {
 
   const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
   const format = ytdl.chooseFormat(info.formats, { quality: 'lowestaudio', filter: 'audioonly' });
-
   if (!format) throw new Error('No audio format available via ytdl-core');
 
   return new Promise((resolve, reject) => {
@@ -147,37 +213,10 @@ async function downloadAudioYtdlCore(videoId) {
   });
 }
 
-// Download audio using youtubei.js (Innertube API, most reliable Node.js option)
-async function downloadAudioInnertube(videoId) {
-  const { Innertube } = require('youtubei.js');
-  const tmpDir = os.tmpdir();
-  const outputPath = path.join(tmpDir, `yt-audio-${videoId}-${Date.now()}.webm`);
-
-  const yt = await Innertube.create();
-  const info = await yt.getBasicInfo(videoId);
-  const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-
-  if (!format) throw new Error('No audio format available via youtubei.js');
-
-  const stream = await info.download({ type: 'audio', quality: 'best' });
-  const writeStream = fs.createWriteStream(outputPath);
-
-  for await (const chunk of stream) {
-    writeStream.write(chunk);
-  }
-  writeStream.end();
-
-  return new Promise((resolve, reject) => {
-    writeStream.on('finish', () => resolve(outputPath));
-    writeStream.on('error', reject);
-  });
-}
-
-// Download audio — tries multiple methods in order of reliability
+// Download audio — tries multiple methods
 async function downloadAudio(videoId) {
   const errors = [];
 
-  // Try yt-dlp first (system binary, most reliable)
   if (await isYtDlpAvailable()) {
     try {
       return await downloadAudioYtDlp(videoId);
@@ -185,32 +224,30 @@ async function downloadAudio(videoId) {
       console.log(`[YouTube] yt-dlp download failed: ${err.message}`);
       errors.push(err.message);
     }
-  } else {
-    console.log('[YouTube] yt-dlp not available on system');
   }
 
-  // Try youtubei.js (Innertube API — most reliable Node.js option)
   try {
-    console.log('[YouTube] Trying youtubei.js for audio download...');
+    console.log('[YouTube] Trying youtubei.js audio download...');
     return await downloadAudioInnertube(videoId);
   } catch (err) {
     console.log(`[YouTube] youtubei.js download failed: ${err.message}`);
     errors.push(err.message);
   }
 
-  // Try @distube/ytdl-core as last resort
   try {
-    console.log('[YouTube] Trying @distube/ytdl-core for audio download...');
+    console.log('[YouTube] Trying ytdl-core audio download...');
     return await downloadAudioYtdlCore(videoId);
   } catch (err) {
     console.log(`[YouTube] ytdl-core download failed: ${err.message}`);
     errors.push(err.message);
   }
 
-  throw new Error(`All audio download methods failed: ${errors.join('; ')}`);
+  throw new Error(`Audio download failed: ${errors.join('; ')}`);
 }
 
-// Method 2: OpenAI Whisper transcription
+// ─── AI Transcription Methods ──────────────────────────────────────────────
+
+// Method 3: OpenAI Whisper
 async function tryWhisperTranscription(videoId) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY not set');
@@ -218,11 +255,11 @@ async function tryWhisperTranscription(videoId) {
   const OpenAI = require('openai');
   const client = new OpenAI({ apiKey });
 
-  console.log(`[YouTube] Downloading audio for ${videoId} (Whisper fallback)...`);
+  console.log(`[YouTube] Downloading audio for Whisper...`);
   const audioPath = await downloadAudio(videoId);
 
   try {
-    console.log(`[YouTube] Transcribing with Whisper: ${audioPath}`);
+    console.log(`[YouTube] Transcribing with Whisper...`);
     const transcription = await client.audio.transcriptions.create({
       model: 'whisper-1',
       file: fs.createReadStream(audioPath),
@@ -230,14 +267,14 @@ async function tryWhisperTranscription(videoId) {
     });
 
     const transcript = typeof transcription === 'string' ? transcription : transcription.text;
-    if (!transcript || !transcript.trim()) throw new Error('Empty Whisper transcription');
+    if (!transcript || !transcript.trim()) throw new Error('Empty Whisper result');
     return { transcript: transcript.trim(), method: 'whisper' };
   } finally {
     fs.unlink(audioPath, () => {});
   }
 }
 
-// Method 3: AssemblyAI transcription
+// Method 4: AssemblyAI
 async function tryAssemblyAITranscription(videoId) {
   const apiKey = process.env.ASSEMBLYAI_API_KEY;
   if (!apiKey) throw new Error('ASSEMBLYAI_API_KEY not set');
@@ -245,28 +282,48 @@ async function tryAssemblyAITranscription(videoId) {
   const { AssemblyAI } = require('assemblyai');
   const client = new AssemblyAI({ apiKey });
 
-  console.log(`[YouTube] Downloading audio for ${videoId} (AssemblyAI fallback)...`);
+  console.log(`[YouTube] Downloading audio for AssemblyAI...`);
   const audioPath = await downloadAudio(videoId);
 
   try {
-    console.log(`[YouTube] Transcribing with AssemblyAI: ${audioPath}`);
-    const transcript = await client.transcripts.transcribe({
-      audio: audioPath,
-    });
+    console.log(`[YouTube] Transcribing with AssemblyAI...`);
+    const transcript = await client.transcripts.transcribe({ audio: audioPath });
 
-    if (transcript.status === 'error') {
-      throw new Error(`AssemblyAI error: ${transcript.error}`);
-    }
+    if (transcript.status === 'error') throw new Error(`AssemblyAI: ${transcript.error}`);
 
     const text = transcript.text;
-    if (!text || !text.trim()) throw new Error('Empty AssemblyAI transcription');
+    if (!text || !text.trim()) throw new Error('Empty AssemblyAI result');
     return { transcript: text.trim(), method: 'assemblyai' };
   } finally {
     fs.unlink(audioPath, () => {});
   }
 }
 
-// Diagnostic endpoint — shows what transcript methods are available
+// ─── Fetch video title ─────────────────────────────────────────────────────
+
+async function fetchVideoTitle(videoId) {
+  try {
+    const playerData = await fetchPlayerData(videoId);
+    if (playerData?.videoDetails?.title) return playerData.videoDetails.title;
+  } catch {}
+
+  try {
+    const title = await new Promise((resolve, reject) => {
+      execFile('yt-dlp', ['--get-title', '--no-download', `https://www.youtube.com/watch?v=${videoId}`], {
+        timeout: 15000,
+      }, (error, stdout) => {
+        if (error || !stdout.trim()) reject(error);
+        else resolve(stdout.trim());
+      });
+    });
+    return title;
+  } catch {}
+
+  return `YouTube Video (${videoId})`;
+}
+
+// ─── Diagnostic endpoint ───────────────────────────────────────────────────
+
 router.get('/status', async (req, res) => {
   const ytDlpAvailable = await isYtDlpAvailable();
   let ytdlCoreAvailable = false;
@@ -274,24 +331,20 @@ router.get('/status', async (req, res) => {
   try { require('@distube/ytdl-core'); ytdlCoreAvailable = true; } catch {}
   try { require('youtubei.js'); innertubeAvailable = true; } catch {}
 
-  const audioMethod = ytDlpAvailable ? 'yt-dlp' : (innertubeAvailable ? 'youtubei.js' : (ytdlCoreAvailable ? 'ytdl-core' : 'none'));
-
   res.json({
     methods: {
-      captions_lib: { available: true, note: 'youtube-transcript npm library' },
-      captions_innertube: { available: innertubeAvailable, note: 'youtubei.js Innertube API' },
+      direct_captions: { available: true, note: 'Direct YouTube page scraping (no API key needed)' },
+      youtube_transcript_lib: { available: true, note: 'youtube-transcript npm package' },
       whisper: {
         available: !!process.env.OPENAI_API_KEY,
-        audioDownload: audioMethod,
-        note: process.env.OPENAI_API_KEY ? 'OpenAI Whisper ready' : 'OPENAI_API_KEY not set',
+        note: process.env.OPENAI_API_KEY ? 'Ready' : 'OPENAI_API_KEY not set',
       },
       assemblyai: {
         available: !!process.env.ASSEMBLYAI_API_KEY,
-        audioDownload: audioMethod,
-        note: process.env.ASSEMBLYAI_API_KEY ? 'AssemblyAI ready' : 'ASSEMBLYAI_API_KEY not set',
+        note: process.env.ASSEMBLYAI_API_KEY ? 'Ready' : 'ASSEMBLYAI_API_KEY not set',
       },
     },
-    system: {
+    audio_download: {
       ytDlp: ytDlpAvailable,
       innertube: innertubeAvailable,
       ytdlCore: ytdlCoreAvailable,
@@ -299,7 +352,8 @@ router.get('/status', async (req, res) => {
   });
 });
 
-// Fetch transcript for a YouTube video with fallback chain
+// ─── Main transcript endpoint ──────────────────────────────────────────────
+
 router.post('/transcript', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
@@ -309,10 +363,26 @@ router.post('/transcript', async (req, res) => {
 
   const errors = [];
 
-  // Method 1a: Try youtube-transcript library (captions) — fast and free
+  // Method 1: Direct caption extraction (most reliable, no deps)
   try {
-    console.log(`[YouTube] Trying youtube-transcript library for ${videoId}...`);
-    const { transcript, method } = await tryYoutubeTranscript(videoId);
+    console.log(`[YouTube] Method 1: Direct caption extraction for ${videoId}...`);
+    const { transcript, title, method } = await tryDirectCaptions(videoId);
+    return res.json({
+      videoId,
+      title,
+      transcript,
+      method,
+      thumbnailUrl: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+    });
+  } catch (err) {
+    console.log(`[YouTube] Direct captions failed: ${err.message}`);
+    errors.push(`Direct captions: ${err.message}`);
+  }
+
+  // Method 2: youtube-transcript npm library
+  try {
+    console.log(`[YouTube] Method 2: youtube-transcript lib for ${videoId}...`);
+    const { transcript, method } = await tryYoutubeTranscriptLib(videoId);
     const title = await fetchVideoTitle(videoId);
     return res.json({
       videoId,
@@ -322,29 +392,13 @@ router.post('/transcript', async (req, res) => {
       thumbnailUrl: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
     });
   } catch (err) {
-    console.log(`[YouTube] youtube-transcript failed: ${err.message}`);
-    errors.push(`Captions (lib): ${err.message}`);
+    console.log(`[YouTube] youtube-transcript lib failed: ${err.message}`);
+    errors.push(`Caption lib: ${err.message}`);
   }
 
-  // Method 1b: Try youtubei.js Innertube captions (more reliable)
+  // Method 3: OpenAI Whisper (requires API key + audio download)
   try {
-    console.log(`[YouTube] Trying youtubei.js captions for ${videoId}...`);
-    const { transcript, method } = await tryInnertubeTranscript(videoId);
-    const title = await fetchVideoTitle(videoId);
-    return res.json({
-      videoId,
-      title,
-      transcript,
-      method,
-      thumbnailUrl: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
-    });
-  } catch (err) {
-    console.log(`[YouTube] youtubei.js captions failed: ${err.message}`);
-    errors.push(`Captions (innertube): ${err.message}`);
-  }
-
-  // Method 2: Try OpenAI Whisper
-  try {
+    console.log(`[YouTube] Method 3: Whisper for ${videoId}...`);
     const { transcript, method } = await tryWhisperTranscription(videoId);
     const title = await fetchVideoTitle(videoId);
     return res.json({
@@ -359,8 +413,9 @@ router.post('/transcript', async (req, res) => {
     errors.push(`Whisper: ${err.message}`);
   }
 
-  // Method 3: Try AssemblyAI
+  // Method 4: AssemblyAI (requires API key + audio download)
   try {
+    console.log(`[YouTube] Method 4: AssemblyAI for ${videoId}...`);
     const { transcript, method } = await tryAssemblyAITranscription(videoId);
     const title = await fetchVideoTitle(videoId);
     return res.json({
@@ -376,7 +431,7 @@ router.post('/transcript', async (req, res) => {
   }
 
   // All methods failed
-  console.error(`[YouTube] All transcript methods failed for ${videoId}:`, errors);
+  console.error(`[YouTube] ALL methods failed for ${videoId}:`, errors);
   res.status(500).json({
     error: 'Failed to get transcript. All methods exhausted.',
     details: errors,
