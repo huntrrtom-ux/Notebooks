@@ -57,7 +57,11 @@ export default function CanvasCard({
       });
       setYoutubeUrl('');
     } catch (err) {
-      alert('Failed to fetch transcript: ' + err.message);
+      let msg = 'Failed to fetch transcript: ' + err.message;
+      if (err.details && err.details.length > 0) {
+        msg += '\n\nDetails:\n' + err.details.map(d => '• ' + d).join('\n');
+      }
+      alert(msg);
     } finally {
       setYoutubeLoading(false);
     }
