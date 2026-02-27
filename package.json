@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@distube/ytdl-core": "^4.16.12",
     "assemblyai": "^4.23.1",
     "better-sqlite3": "^11.7.0",
     "concurrently": "^9.1.0",
